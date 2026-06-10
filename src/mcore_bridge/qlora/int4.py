@@ -142,11 +142,48 @@ def _grouped_mm(x, w, m_splits, trans_b):
     return torch._grouped_mm(x, w.transpose(1, 2) if trans_b else w, offs=offs)
 
 
+def _w4a16_dims_ok(packed):
+    out, in_ = packed.shape[-2], packed.shape[-1] * 8
+    return out % 128 == 0 and in_ % 128 == 0  # kernel BN/BK tiling, no masks on weight loads
+
+
+def _resolve_w4a16(device):
+    """Validate the fused W4A16 grouped kernel (in-register dequant, both orientations,
+    incl. an empty expert segment) against dequant+loop on synthetic tensors."""
+    from . import w4a16 as _w
+    g = torch.Generator(device=device).manual_seed(0)
+    E, out, in_ = 3, 128, 256
+    packed = torch.randint(-2**31, 2**31 - 1, (E, out, in_ // 8), dtype=torch.int32, device=device)
+    scale = (torch.rand(E, out, in_ // 32, device=device, generator=g) * 0.02 + 1e-3).to(torch.bfloat16)
+    w = dequant_int4(packed, scale)
+    m_splits = [5, 0, 7]
+    x = torch.randn(sum(m_splits), in_, dtype=torch.bfloat16, device=device, generator=g)
+    dy = torch.randn(sum(m_splits), out, dtype=torch.bfloat16, device=device, generator=g)
+    yf = _w.w4a16_grouped_fwd(x, packed, scale, m_splits)
+    yb = _w.w4a16_grouped_dgrad(dy, packed, scale, m_splits)
+    assert torch.allclose(yf.float(), _gemm_loop(x, w, m_splits, True).float(), atol=2e-2, rtol=2e-2), 'w4a16 fwd'
+    assert torch.allclose(yb.float(), _gemm_loop(dy, w, m_splits, False).float(), atol=2e-2, rtol=2e-2), 'w4a16 dgrad'
+    return _w
+
+
+_W4A16 = None  # module handle once validated
+
+
 def _resolve_gemm_mode(device):
-    """Validate torch._grouped_mm against the loop reference on tiny synthetic tensors,
-    in BOTH orientations (forward trans_b=True and dgrad trans_b=False), incl. an empty
-    expert segment. Any failure -> per-expert loop."""
-    choice = _env_choice('EE_QLORA_GEMM', {'auto', 'grouped', 'loop'})
+    """Pick the fastest validated implementation: fused w4a16 -> torch._grouped_mm ->
+    per-expert loop. Each candidate is parity-checked on tiny synthetic tensors in BOTH
+    orientations (forward trans_b=True and dgrad trans_b=False), incl. an empty expert
+    segment. Any failure -> next rung."""
+    global _W4A16
+    choice = _env_choice('EE_QLORA_GEMM', {'auto', 'w4a16', 'grouped', 'loop'})
+    if choice in {'auto', 'w4a16'}:
+        try:
+            _W4A16 = _resolve_w4a16(device)
+            return 'w4a16'
+        except Exception as e:  # noqa: BLE001
+            if choice == 'w4a16':
+                raise
+            warnings.warn(f'[qlora-int4] w4a16 kernel unavailable ({e!r}); trying torch._grouped_mm')
     if choice == 'loop' or not hasattr(torch, '_grouped_mm'):
         return 'loop'
     try:
@@ -188,17 +225,29 @@ class _QloraGroupedLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, packed, scale, m_splits):
-        w = _dequant(packed, scale, x.dtype)  # [E, out, in], transient
         ctx.m_splits = m_splits
         ctx.save_for_backward(packed, scale)
-        return _gemm(x, w, m_splits, trans_b=True)
+        return _apply_gemm(x, packed, scale, m_splits, trans_b=True)
 
     @staticmethod
     def backward(ctx, dy):
         packed, scale = ctx.saved_tensors
-        w = _dequant(packed, scale, dy.dtype)
-        dx = _gemm(dy.contiguous(), w, ctx.m_splits, trans_b=False)
+        dx = _apply_gemm(dy.contiguous(), packed, scale, ctx.m_splits, trans_b=False)
         return dx, None, None, None
+
+
+def _apply_gemm(a, packed, scale, m_splits, trans_b):
+    """Dispatch one segmented expert matmul. w4a16 mode never materializes the bf16
+    weights; the other modes dequant first (transient) and run grouped_mm / the loop."""
+    global _GEMM_MODE
+    if _GEMM_MODE is None:
+        _GEMM_MODE = _resolve_gemm_mode(a.device) if a.is_cuda else 'loop'
+    if (_GEMM_MODE == 'w4a16' and a.is_cuda and a.dtype == torch.bfloat16
+            and a.is_contiguous() and _w4a16_dims_ok(packed)):
+        fn = _W4A16.w4a16_grouped_fwd if trans_b else _W4A16.w4a16_grouped_dgrad
+        return fn(a, packed, scale, m_splits)
+    w = _dequant(packed, scale, a.dtype)
+    return _gemm(a, w, m_splits, trans_b)
 
 
 def qlora_grouped_forward(self, x: torch.Tensor, m_splits, *args, **kwargs):

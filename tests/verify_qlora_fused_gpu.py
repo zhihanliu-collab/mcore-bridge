@@ -93,6 +93,26 @@ def main():
               f'dequant={_m._DEQUANT_MODE} gemm={_m._GEMM_MODE})')
         ok &= pf and pb
 
+        # fused W4A16 grouped kernel: parity at real shapes, both orientations
+        try:
+            from importlib import util as _u
+            _ws = _u.spec_from_file_location(
+                'qlora_w4a16', os.path.join(os.path.dirname(__file__), '..', 'src', 'mcore_bridge', 'qlora',
+                                            'w4a16.py'))
+            _w = _u.module_from_spec(_ws)
+            _ws.loader.exec_module(_w)
+            wf = _w.w4a16_grouped_fwd(x, packed, scale, m_splits)
+            wb = _w.w4a16_grouped_dgrad(dy, packed, scale, m_splits)
+            pf = torch.allclose(wf.float(), loop_f.float(), atol=2e-2, rtol=2e-2)
+            pb = torch.allclose(wb.float(), loop_b.float(), atol=2e-2, rtol=2e-2)
+            print(f'[w4a16 {name}] parity fwd: {pf} dgrad: {pb} '
+                  f'(max fwd diff {(wf.float() - loop_f.float()).abs().max():.4f})')
+            ok &= pf and pb
+        except Exception as exc:  # noqa: BLE001
+            print(f'[w4a16 {name}] FAILED: {exc!r}')
+            ok = False
+            _w = None
+
         # microbench
         t_dq_torch = timed(lambda: _m.dequant_int4(packed, scale))
         t_dq_tri = timed(lambda: _m.dequant_int4_triton(packed, scale))
@@ -105,6 +125,9 @@ def main():
                 rows.append(f'gemm grouped {t_gm:7.2f}ms')
             except Exception:  # noqa: BLE001
                 pass
+        if _w is not None:
+            rows.append(f'w4a16 fwd {timed(lambda: _w.w4a16_grouped_fwd(x, packed, scale, m_splits)):7.2f}ms')
+            rows.append(f'w4a16 dgrad {timed(lambda: _w.w4a16_grouped_dgrad(dy, packed, scale, m_splits)):7.2f}ms')
 
         def fwd_bwd():
             xx = x.clone().requires_grad_(True)
