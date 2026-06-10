@@ -68,6 +68,12 @@ def _convert_one(module):
     for attr in ('weight_tensors', 'bias_tensors'):
         if hasattr(module, attr):
             setattr(module, attr, [])
+    # peft's _replace_module does `next(child.parameters())` to pick the device when
+    # wrapping with LoRA — a module with zero Parameters raises StopIteration. Keep one
+    # tiny frozen anchor param (ignored by DDP/optimizer/saves since requires_grad=False).
+    module.register_parameter('qlora_anchor',
+                              torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16, device=device),
+                                                 requires_grad=False))
     module.register_buffer('weight_packed',
                            torch.empty(num_gemms, real_out, real_in // 8, dtype=torch.int32, device=device))
     module.register_buffer(
