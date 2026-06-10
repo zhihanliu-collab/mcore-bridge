@@ -1,15 +1,20 @@
 # W4A16 grouped GEMM for INT4 frozen-base qLoRA: the packed int4 weights are
 # dequantized in-register inside the GEMM K-loop; the bf16 weight tensor is never
-# materialized in HBM. Replaces dequant(0.66r+2.6w GiB) + GEMM(2.6r GiB) per call
-# with a single pass reading ~0.66 GiB of packed data.
+# materialized in HBM.
+#
+# Addressing strategy (v2.1): packed words are loaded in their NATIVE layout
+# ([rows, in/8] int32, coalesced) and the 8 nibbles per word are expanded in
+# registers via broadcast + reshape — never a per-element gather (the v2.0 gather
+# was ~40x slower than dequant+grouped_mm; see job 1006).
 #
 # Two orientations, one kernel (constexpr PACK_ALONG_K):
-#   forward: y_g = x_g  @ W_g^T   W [E, out, in] packed along in  -> in  is the K dim
-#   dgrad:   dx_g = dy_g @ W_g    W [E, out, in] packed along in  -> in  is the N dim
+#   forward: y_g = x_g  @ W_g^T   W [E, out, in] packed along in -> in is the K dim
+#            (weight tile loaded [BN, BK], transposed in registers for tl.dot)
+#   dgrad:   dx_g = dy_g @ W_g    packed dim is the N dim (tile loads already [BK, BN])
 #
 # Layout facts (compressed-tensors pack-quantized): weight_packed int32 [E, out, in/8]
 # (8 nibbles per int32 along the *input* dim, LSB-first, offset-unsigned u4 = q + 8);
-# weight_scale bf16 [E, out, in/32].
+# weight_scale bf16 [E, out, in/32], group_size 32 = 4 packed words.
 import torch
 
 import triton
@@ -17,11 +22,22 @@ import triton.language as tl
 
 
 @triton.jit
+def _unpack_block(pk, s, ROWS: tl.constexpr, COLS: tl.constexpr):
+    """pk int32 [ROWS, COLS/8], s bf16 [ROWS, COLS/32] -> bf16 [ROWS, COLS]."""
+    shifts = (tl.arange(0, 8) * 4)
+    q = (pk[:, :, None] >> shifts[None, None, :]) & 0xF  # [ROWS, COLS/8, 8]
+    q = tl.reshape(q, (ROWS, COLS)) - 8
+    sf = tl.broadcast_to(s.to(tl.float32)[:, :, None], (ROWS, COLS // 32, 32))
+    sf = tl.reshape(sf, (ROWS, COLS))
+    return (q.to(tl.float32) * sf).to(tl.bfloat16)
+
+
+@triton.jit
 def _w4a16_grouped_kernel(
     a_ptr, packed_ptr, scale_ptr, y_ptr,
     m_starts_ptr, m_sizes_ptr,
     N, K,
-    OUT, IN_P, IN_G,  # per-expert packed strides: rows, packed cols, scale-group cols
+    OUT, IN_P, IN_G,  # per-expert weight strides: rows, packed cols, scale-group cols
     PACK_ALONG_K: tl.constexpr,
     BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
 ):
@@ -46,20 +62,19 @@ def _w4a16_grouped_kernel(
         offs_k = k0 + tl.arange(0, BK)
         a = tl.load(a_ptr + a_row[:, None] * K + offs_k[None, :], mask=mask_m[:, None], other=0.0)
         if PACK_ALONG_K:
-            # forward: b[k, n] = W[n, k]; packed along k
-            pcol = offs_k // 8
-            shift = (offs_k % 8) * 4
-            pk = tl.load(p_base + offs_n[None, :].to(tl.int64) * IN_P + pcol[:, None])
-            q = ((pk >> shift[:, None]) & 0xF) - 8
-            s = tl.load(s_base + offs_n[None, :].to(tl.int64) * IN_G + (offs_k // 32)[:, None]).to(tl.float32)
+            # weight rows = n (out), packed cols along k: load [BN, BK/8] coalesced
+            pcols = (k0 // 8) + tl.arange(0, BK // 8)
+            pk = tl.load(p_base + offs_n[:, None].to(tl.int64) * IN_P + pcols[None, :])
+            scols = (k0 // 32) + tl.arange(0, BK // 32)
+            s = tl.load(s_base + offs_n[:, None].to(tl.int64) * IN_G + scols[None, :])
+            b = tl.trans(_unpack_block(pk, s, BN, BK))  # [BK, BN]
         else:
-            # dgrad: b[k, n] = W[k, n]; packed along n
-            pcol = offs_n // 8
-            shift = (offs_n % 8) * 4
-            pk = tl.load(p_base + offs_k[:, None].to(tl.int64) * IN_P + pcol[None, :])
-            q = ((pk >> shift[None, :]) & 0xF) - 8
-            s = tl.load(s_base + offs_k[:, None].to(tl.int64) * IN_G + (offs_n // 32)[None, :]).to(tl.float32)
-        b = (q.to(tl.float32) * s).to(tl.bfloat16)
+            # weight rows = k (out), packed cols along n: load [BK, BN/8] coalesced
+            pcols = (nt * BN // 8) + tl.arange(0, BN // 8)
+            pk = tl.load(p_base + offs_k[:, None].to(tl.int64) * IN_P + pcols[None, :])
+            scols = (nt * BN // 32) + tl.arange(0, BN // 32)
+            s = tl.load(s_base + offs_k[:, None].to(tl.int64) * IN_G + scols[None, :])
+            b = _unpack_block(pk, s, BK, BN)  # [BK, BN]
         acc += tl.dot(a, b)
 
     y_offs = a_row[:, None] * N + offs_n[None, :]
@@ -75,6 +90,8 @@ def _launch(a, packed, scale, m_splits, pack_along_k):
         assert K == in_p * 8, f'K {K} != packed in {in_p * 8}'
     else:
         assert K == out, f'K {K} != out {out}'
+    BM, BN, BK = 64, 128, 64
+    assert N % BN == 0 and K % BK == 0, f'unsupported dims N={N} K={K} for tiling {BN}x{BK}'
     m_sizes = torch.tensor(m_splits, device=a.device, dtype=torch.int32)
     m_starts = torch.zeros_like(m_sizes)
     torch.cumsum(m_sizes[:-1], 0, dtype=torch.int32, out=m_starts[1:])
@@ -82,8 +99,7 @@ def _launch(a, packed, scale, m_splits, pack_along_k):
     max_m = max(m_splits) if m_splits else 0
     if max_m == 0:
         return y
-    BM, BN, BK = 64, 128, 64
-    grid = (E, triton.cdiv(max_m, BM), triton.cdiv(N, BN))
+    grid = (E, triton.cdiv(max_m, BM), N // BN)
     _w4a16_grouped_kernel[grid](
         a, packed, scale, y, m_starts, m_sizes,
         N, K, out, in_p, in_g,

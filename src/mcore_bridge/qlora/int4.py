@@ -151,7 +151,14 @@ def _w4a16_dims_ok(packed):
 def _resolve_w4a16(device):
     """Validate the fused W4A16 grouped kernel (in-register dequant, both orientations,
     incl. an empty expert segment) against dequant+loop on synthetic tensors."""
-    from . import w4a16 as _w
+    try:
+        from . import w4a16 as _w
+    except ImportError:  # standalone load (tests import int4.py directly via importlib)
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            'qlora_w4a16', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'w4a16.py'))
+        _w = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_w)
     g = torch.Generator(device=device).manual_seed(0)
     E, out, in_ = 3, 128, 256
     packed = torch.randint(-2**31, 2**31 - 1, (E, out, in_ // 8), dtype=torch.int32, device=device)
@@ -177,14 +184,12 @@ def _resolve_gemm_mode(device):
     segment. Any failure -> next rung."""
     global _W4A16
     choice = _env_choice('EE_QLORA_GEMM', {'auto', 'w4a16', 'grouped', 'loop'})
-    if choice in {'auto', 'w4a16'}:
-        try:
-            _W4A16 = _resolve_w4a16(device)
-            return 'w4a16'
-        except Exception as e:  # noqa: BLE001
-            if choice == 'w4a16':
-                raise
-            warnings.warn(f'[qlora-int4] w4a16 kernel unavailable ({e!r}); trying torch._grouped_mm')
+    # w4a16 is EXPLICIT-ONLY for now: numerics validated (bit-clean parity, job 1006)
+    # but the naive gather addressing is ~40x slower than dequant+grouped_mm. Re-add to
+    # 'auto' only after the coalesced-load rewrite beats 'grouped' in the microbench.
+    if choice == 'w4a16':
+        _W4A16 = _resolve_w4a16(device)
+        return 'w4a16'
     if choice == 'loop' or not hasattr(torch, '_grouped_mm'):
         return 'loop'
     try:
