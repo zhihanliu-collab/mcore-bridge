@@ -96,6 +96,16 @@ def test_grouped_forward_and_grad():
     out2, _ = qlora_grouped_forward(mod, x, torch.tensor(m_splits))
     out2.float().pow(2).sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad.float()).all()
+
+    # dgrad parity: custom-Function dx must match plain autograd through the dequanted weights
+    x_ref = x.detach().clone().requires_grad_(True)
+    ref_out = torch.cat([
+        torch.nn.functional.linear(x_ref[0:5], w_l[0]),
+        torch.nn.functional.linear(x_ref[5:5], w_l[1]),
+        torch.nn.functional.linear(x_ref[5:12], w_l[2]),
+    ])
+    ref_out.float().pow(2).sum().backward()
+    assert torch.equal(x.grad, x_ref.grad), 'custom backward dx != autograd reference dx'
     print('test_grouped_forward_and_grad OK')
 
 
