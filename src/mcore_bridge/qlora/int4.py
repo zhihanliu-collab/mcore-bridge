@@ -122,6 +122,7 @@ def _dequant(packed, scale, dtype):
                     raise
                 warnings.warn(f'[qlora-int4] triton dequant unavailable ({e!r}); falling back to torch')
                 _DEQUANT_MODE = 'torch'
+        _log_resolved('dequant', _DEQUANT_MODE)
     if _DEQUANT_MODE == 'triton' and packed.is_cuda and dtype == torch.bfloat16:
         return dequant_int4_triton(packed, scale)
     return dequant_int4(packed, scale, dtype)
@@ -236,12 +237,22 @@ class _QloraGroupedLinear(torch.autograd.Function):
         return dx, None, None, None
 
 
+def _log_resolved(kind, mode):
+    """Record the resolved implementation in the run log (rank0) — every run must be
+    attributable to an exact kernel path; env forces a path or the run fails loudly."""
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(f'[qlora-int4] resolved {kind} implementation: {mode} '
+              f'(EE_QLORA_{kind.upper()}={os.environ.get(f"EE_QLORA_{kind.upper()}", "auto")})',
+              flush=True)
+
+
 def _apply_gemm(a, packed, scale, m_splits, trans_b):
     """Dispatch one segmented expert matmul. w4a16 mode never materializes the bf16
     weights; the other modes dequant first (transient) and run grouped_mm / the loop."""
     global _GEMM_MODE
     if _GEMM_MODE is None:
         _GEMM_MODE = _resolve_gemm_mode(a.device) if a.is_cuda else 'loop'
+        _log_resolved('gemm', _GEMM_MODE)
     if (_GEMM_MODE == 'w4a16' and a.is_cuda and a.dtype == torch.bfloat16
             and a.is_contiguous() and _w4a16_dims_ok(packed)):
         fn = _W4A16.w4a16_grouped_fwd if trans_b else _W4A16.w4a16_grouped_dgrad
