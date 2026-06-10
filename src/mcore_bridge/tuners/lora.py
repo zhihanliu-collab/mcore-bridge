@@ -481,6 +481,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             return
 
         base_layer = self.get_base_layer()
+        if getattr(base_layer, '_qlora_int4', False):
+            raise NotImplementedError('merge() is not supported for an INT4 qLoRA frozen base; '
+                                      'keep --merge_lora false and serve base + adapter separately.')
         origin_device = base_layer.weight0.device if self.is_grouped else base_layer.weight.device
         if origin_device.type == 'cpu':
             self.to(device=get_current_device())

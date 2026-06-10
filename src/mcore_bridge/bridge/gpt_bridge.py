@@ -770,6 +770,52 @@ class GPTBridge:
         else:
             return False
 
+    def _maybe_set_packed_experts(self, mg_mlp, hf_state_dict, ep_rank, num_local_experts) -> bool:
+        """Load compressed-tensors pack-quantized (INT4) routed-expert weights into the
+        packed buffers created by qlora.convert_expert_modules. Returns True if handled.
+
+        HF layout per expert linear: weight_packed int32 [out, in//8] +
+        weight_scale bf16 [out, in//group] (+ weight_shape, ignored). gate/up are
+        packed along the input dim, so fusing into linear_fc1 is a plain dim-0 concat.
+        Requires ETP=1 (whole experts per rank): packed tensors are copied unsplit.
+        """
+        start_idx = ep_rank * num_local_experts
+        has_packed = f'{start_idx}.gate_proj.weight_packed' in hf_state_dict
+        fc1, fc2 = mg_mlp.linear_fc1, mg_mlp.linear_fc2
+        if isinstance(fc1, LoraParallelLinear):
+            fc1 = fc1.base_layer
+        if isinstance(fc2, LoraParallelLinear):
+            fc2 = fc2.base_layer
+        is_qlora = getattr(fc1, '_qlora_int4', False)
+        if not has_packed and not is_qlora:
+            return False
+        if has_packed and not is_qlora:
+            raise RuntimeError('Checkpoint has pack-quantized (INT4) expert weights but the model was not '
+                               'converted for qLoRA. Set EE_QLORA_INT4=1, or use a bf16 checkpoint dir.')
+        if is_qlora and not has_packed:
+            raise RuntimeError('Model is in INT4 qLoRA mode but the checkpoint has no weight_packed expert '
+                               'tensors. Point --model at the pack-quantized (INT4) checkpoint dir.')
+
+        def _copy(dst_packed, dst_scale, packed, scale, key):
+            assert dst_packed.shape == packed.shape, f'{key}: packed {tuple(packed.shape)} vs buffer ' \
+                f'{tuple(dst_packed.shape)} (requires ETP=1 and group_size=32)'
+            assert dst_scale.shape == scale.shape, f'{key}: scale {tuple(scale.shape)} vs buffer {tuple(dst_scale.shape)}'
+            dst_packed.copy_(packed)
+            dst_scale.copy_(scale.to(dst_scale.dtype))
+
+        for i in range(num_local_experts):
+            e = start_idx + i
+            gate_p = hf_state_dict[f'{e}.gate_proj.weight_packed'].load()
+            up_p = hf_state_dict[f'{e}.up_proj.weight_packed'].load()
+            gate_s = hf_state_dict[f'{e}.gate_proj.weight_scale'].load()
+            up_s = hf_state_dict[f'{e}.up_proj.weight_scale'].load()
+            _copy(fc1.weight_packed[i], fc1.weight_scale[i], torch.cat([gate_p, up_p], dim=0),
+                  torch.cat([gate_s, up_s], dim=0), f'experts.{e}.linear_fc1')
+            down_p = hf_state_dict[f'{e}.down_proj.weight_packed'].load()
+            down_s = hf_state_dict[f'{e}.down_proj.weight_scale'].load()
+            _copy(fc2.weight_packed[i], fc2.weight_scale[i], down_p, down_s, f'experts.{e}.linear_fc2')
+        return True
+
     def _set_mlp_state(
         self,
         mg_mlp,
@@ -803,6 +849,12 @@ class GPTBridge:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         elif not to_mcore:
             hf_state_dict = {}
+
+        # INT4 qLoRA: routed experts stored as compressed-tensors pack-quantized
+        # (weight_packed/weight_scale). Loaded into packed buffers, dequantized at forward.
+        if (to_mcore and is_expert and not self._peft_format and not is_gate_up and mg_mlp is not None
+                and self._maybe_set_packed_experts(mg_mlp, hf_state_dict, ep_rank, num_local_experts)):
+            return {}
 
         # linear_fc1
         if to_mcore:
@@ -1886,6 +1938,9 @@ class GPTBridge:
         mg_models = unwrap_model(mg_models)
         self._disable_tqdm = False
         self._is_saving = False
+        if not peft_format:
+            from ..qlora import convert_expert_modules
+            convert_expert_modules(mg_models)  # no-op unless EE_QLORA_INT4=1
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, peft_format=peft_format) as loader:
             state_dict = loader.get_state_dict()
             if converter:

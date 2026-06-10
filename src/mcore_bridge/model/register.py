@@ -215,20 +215,22 @@ class ModelLoader:
 
 
 def get_mcore_model(config: ModelConfig) -> List[nn.Module]:
+    from ..qlora import shrink_expert_build
     loader = config.model_meta.loader(config)
     model_type = ModelType.encoder_or_decoder
-    if mpu.get_pipeline_model_parallel_world_size() > 1 and config.virtual_pipeline_model_parallel_size is not None:
-        models = []
-        for i in range(config.virtual_pipeline_model_parallel_size):
-            pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
-            post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
-            model = loader.build_model(pre_process, post_process, vp_stage=i)
-            models.append(model)
-    else:
-        pre_process = mpu.is_pipeline_first_stage()
-        post_process = mpu.is_pipeline_last_stage()
-        model = loader.build_model(pre_process=pre_process, post_process=post_process)
-        models = [model]
+    with shrink_expert_build():  # no-op unless EE_QLORA_INT4=1
+        if mpu.get_pipeline_model_parallel_world_size() > 1 and config.virtual_pipeline_model_parallel_size is not None:
+            models = []
+            for i in range(config.virtual_pipeline_model_parallel_size):
+                pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
+                post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
+                model = loader.build_model(pre_process, post_process, vp_stage=i)
+                models.append(model)
+        else:
+            pre_process = mpu.is_pipeline_first_stage()
+            post_process = mpu.is_pipeline_last_stage()
+            model = loader.build_model(pre_process=pre_process, post_process=post_process)
+            models = [model]
     for model in models:
         model.model_type = model_type
         model.prepare_inputs_for_generation = None
